@@ -1,0 +1,50 @@
+# =============================================================================
+# MicroCity — Prometheus scrape configuration
+#
+# Prometheus fonctionne en mode PULL : il "gratte" les endpoints /metrics de
+# chaque service à intervalle régulier (scrape_interval).
+#
+# Contrairement au modèle push (StatsD, InfluxDB line protocol), les services
+# n'ont pas besoin de connaître l'adresse de Prometheus — ils exposent
+# simplement /metrics. Prometheus est configuré avec les cibles.
+#
+# Résolution DNS :
+#   "api-users", "api-orders", "worker" sont des noms de services Docker.
+#   Prometheus DOIT être sur observability-net pour les résoudre.
+#   Ces noms ne sont pas routables depuis l'hôte.
+# =============================================================================
+
+global:
+  scrape_interval: 15s      # Fréquence de scraping de chaque cible
+  evaluation_interval: 15s  # Fréquence d'évaluation des règles d'alerte
+
+scrape_configs:
+
+  # Prometheus se scrappe lui-même — métriques sur son propre fonctionnement :
+  # go_gc_duration_seconds, prometheus_http_requests_total, etc.
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # api-users — FastAPI (Python) + asyncpg
+  # /metrics retourne les métriques au format text/plain Prometheus exposition.
+  # Label job="api-users" est automatiquement ajouté à toutes les métriques.
+  - job_name: 'api-users'
+    static_configs:
+      - targets: ['api-users:8000']
+    metrics_path: /metrics
+
+  # api-orders — Go net/http + prometheus/client_golang
+  # promhttp.Handler() expose les métriques Go runtime + métriques custom.
+  - job_name: 'api-orders'
+    static_configs:
+      - targets: ['api-orders:8001']
+    metrics_path: /metrics
+
+  # worker — Python pika + prometheus_client
+  # Le worker expose un serveur HTTP minimal sur le port 8002 via
+  # prometheus_client.start_http_server() — aucun framework web.
+  - job_name: 'worker'
+    static_configs:
+      - targets: ['worker:8002']
+    metrics_path: /metrics

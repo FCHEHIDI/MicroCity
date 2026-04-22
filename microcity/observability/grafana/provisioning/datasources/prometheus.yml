@@ -1,0 +1,23 @@
+# =============================================================================
+# Grafana — provisioning automatique de la datasource Prometheus
+#
+# Grafana lit ce fichier au démarrage (via le volume monté) et configure
+# automatiquement la datasource. Plus besoin de cliquer dans l'UI pour
+# ajouter Prometheus manuellement.
+#
+# url : "prometheus" est un nom de service Docker résolu via observability-net.
+#       En dehors du réseau Docker, cette URL ne fonctionnerait pas.
+#
+# access: proxy — Grafana contacte Prometheus en backend (server-side).
+#         Grafana le navigateur ne contacte jamais Prometheus directement.
+# =============================================================================
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    url: http://prometheus:9090
+    isDefault: true
+    access: proxy
+    editable: false
