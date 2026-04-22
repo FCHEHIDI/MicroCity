@@ -1,5 +1,7 @@
 # MicroCity — Observabilite & Conteneurisation Avancee
 
+![Traefik Dashboard](traefik_dashboard.png)
+
 > **Mission** : generer un projet complet nomme MicroCity, un systeme distribue
 > conteneurise concu pour apprendre la conteneurisation avancee, le networking Docker,
 > et l'observabilite moderne.

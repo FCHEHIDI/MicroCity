@@ -36,6 +36,5 @@ Thumbs.db
 *.env.local
 
 # Screenshots / local artifacts
-*.png
 *.jpg
 *.gif
