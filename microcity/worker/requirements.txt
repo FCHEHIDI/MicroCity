@@ -1,0 +1,4 @@
+# pika : client AMQP pour RabbitMQ — protocole de messaging asynchrone.
+# Version fixée pour reproductibilité.
+pika==1.3.2
+prometheus-client==0.20.0
