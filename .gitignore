@@ -34,3 +34,8 @@ Thumbs.db
 # Secrets / env
 .env
 *.env.local
+
+# Screenshots / local artifacts
+*.png
+*.jpg
+*.gif
