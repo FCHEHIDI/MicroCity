@@ -1,0 +1,73 @@
+
+# =============================================================================
+# MicroCity — traefik.toml
+# Configuration statique de Traefik
+#
+# Traefik a deux niveaux de config :
+#   - Statique (ce fichier) : déclaré au démarrage, ne change pas à chaud.
+#     C'est ici qu'on dit à Traefik où écouter et comment découvrir les services.
+#   - Dynamique : générée à chaud depuis les labels Docker des conteneurs.
+#     On n'écrit pas ce niveau manuellement — Traefik le lit tout seul.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# API & Dashboard
+# Traefik expose une interface web sur :8080 pour visualiser les routes actives,
+# les middlewares, l'état des services. Indispensable pour déboguer.
+# insecure = true : pas d'authentification (acceptable en local/dev).
+# En production : toujours protéger cette interface.
+# -----------------------------------------------------------------------------
+[api]
+  dashboard = true
+  insecure  = true
+
+# -----------------------------------------------------------------------------
+# Entrypoints — les portes d'entrée réseau de Traefik
+#
+# Un entrypoint = un port sur lequel Traefik écoute du trafic entrant.
+# On déclare deux entrypoints :
+#
+#   web      → port 80  : trafic HTTP applicatif (nos APIs)
+#   traefik  → port 8080 : trafic vers le dashboard d'administration
+#
+# Traefik reçoit une connexion sur l'entrypoint "web", puis consulte ses
+# règles de routing dynamiques pour décider quel service backend appeler.
+# -----------------------------------------------------------------------------
+[entryPoints]
+  [entryPoints.web]
+    address = ":80"
+
+  [entryPoints.traefik]
+    address = ":8080"
+
+# -----------------------------------------------------------------------------
+# Provider Docker
+# C'est le coeur de la découverte dynamique.
+#
+# Traefik surveille l'API Docker (via le socket Unix monté en volume dans
+# docker-compose.yaml). Dès qu'un conteneur démarre avec les bons labels,
+# Traefik crée automatiquement une route vers lui — sans redémarrage.
+#
+# exposedByDefault = false : IMPORTANT.
+# Par défaut, Traefik expose TOUS les conteneurs qu'il voit.
+# Avec false, seuls les conteneurs qui déclarent explicitement
+# `traefik.enable=true` dans leurs labels sont pris en compte.
+# C'est le comportement correct en production.
+#
+# network = "frontend-net" : Traefik route le trafic via ce réseau.
+# Les conteneurs backend (api-users, api-orders) doivent donc être
+# sur frontend-net ET backend-net — c'est ce qu'on configurera.
+# -----------------------------------------------------------------------------
+[providers.docker]
+  exposedByDefault = false
+  network          = "frontend-net"
+
+# -----------------------------------------------------------------------------
+# Logs
+# Niveau INFO en développement pour voir les routes qui se créent/détruisent.
+# -----------------------------------------------------------------------------
+[log]
+  level = "INFO"
+
+[accessLog]
+  # Chaque requête HTTP routée est loggée — utile pour observer les flux

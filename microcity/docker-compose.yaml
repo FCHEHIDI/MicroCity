@@ -1,0 +1,320 @@
+
+# =============================================================================
+# MicroCity — docker-compose.yaml
+# Phase 2 : déclaration des réseaux uniquement
+# On construit couche par couche : réseaux → services → observabilité
+# =============================================================================
+
+networks:
+
+  # ---------------------------------------------------------------------------
+  # frontend-net
+  # Rôle : point d'entrée unique. Seul le gateway est attaché à ce réseau.
+  # Aucun service applicatif ne vit ici → isolation totale de l'extérieur.
+  # Subnet explicite : permet de contrôler les plages IP et de lire les logs
+  # réseau sans ambiguïté.
+  # ---------------------------------------------------------------------------
+  frontend-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+  # ---------------------------------------------------------------------------
+  # backend-net
+  # Rôle : réseau interne des services applicatifs.
+  # gateway, api-users, api-orders, db, queue, worker vivent ici.
+  # Aucun port exposé vers l'hôte depuis ce réseau.
+  # ---------------------------------------------------------------------------
+  backend-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
+
+  # ---------------------------------------------------------------------------
+  # observability-net
+  # Rôle : réseau dédié à la collecte de métriques, traces, logs.
+  # Séparé pour deux raisons :
+  #   1. Le trafic d'observabilité ne pollue pas le trafic applicatif.
+  #   2. Les outils d'observabilité (Prometheus, Grafana) n'ont accès
+  #      qu'à ce réseau — ils ne peuvent pas initier de connexions vers db
+  #      ou queue par exemple.
+  # ---------------------------------------------------------------------------
+  observability-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.32.0.0/24
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # gateway — Traefik reverse proxy
+  #
+  # Rôle réseau : pont entre l'extérieur et le backend-net.
+  # C'est le seul service avec des ports exposés vers l'hôte.
+  #
+  # Réseaux :
+  #   - frontend-net : reçoit le trafic entrant (port 80 exposé ici)
+  #   - backend-net  : route le trafic vers api-users et api-orders
+  #
+  # Sans backend-net, Traefik ne peut pas résoudre les noms "api-users"
+  # ou "api-orders" — le DNS Docker est réseau-local.
+  # ---------------------------------------------------------------------------
+  gateway:
+    image: traefik:v3.0
+    container_name: microcity-gateway
+    ports:
+      - "80:80"       # trafic HTTP applicatif — le seul port ouvert vers l'hôte
+      - "8080:8080"   # dashboard Traefik — administration locale uniquement
+    volumes:
+      # Traefik lit l'API Docker via ce socket pour découvrir les conteneurs
+      # et générer ses routes dynamiquement.
+      # :ro = read-only — Traefik n'a besoin que de lire, jamais d'écrire.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Config statique montée en lecture
+      - ./gateway/traefik.toml:/etc/traefik/traefik.toml:ro
+    networks:
+      - frontend-net
+      - backend-net
+    labels:
+      # Active Traefik pour ce conteneur (nécessaire car exposedByDefault=false)
+      - "traefik.enable=true"
+    restart: unless-stopped
+
+
+  # ---------------------------------------------------------------------------
+  # api-users — FastAPI (Python)
+  #
+  # Réseaux :
+  #   - frontend-net  : Traefik atteint ce service via ce réseau pour router
+  #                     les requêtes. Sans ce réseau, les labels Traefik sont
+  #                     ignorés — Traefik ne peut pas joindre le service.
+  #   - backend-net   : pour appeler db et queue (phase suivante)
+  #   - observability-net : pour être scrapé par Prometheus
+  #
+  # Labels Traefik — pipeline de routing :
+  #   1. traefik.enable=true           → ce conteneur est géré par Traefik
+  #   2. routers.rule                  → quelle requête déclenche cette route
+  #      PathPrefix(`/users`)          → toute URL commençant par /users
+  #   3. services.loadbalancer.port    → vers quel port interne Traefik envoie
+  # ---------------------------------------------------------------------------
+  api-users:
+    build:
+      context: ./api-users
+      dockerfile: Dockerfile
+    container_name: microcity-api-users
+    networks:
+      - frontend-net
+      - backend-net
+      - observability-net
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=microcity_frontend-net"
+      - "traefik.http.routers.api-users.rule=PathPrefix(`/users`)"
+      - "traefik.http.routers.api-users.entrypoints=web"
+      - "traefik.http.services.api-users.loadbalancer.server.port=8000"
+    environment:
+      # "db" est résolu par le DNS Docker de backend-net → IP de microcity-db.
+      # Ce nom ne fonctionne QUE depuis un conteneur attaché à backend-net.
+      DATABASE_URL: postgresql://microcity:microcity_secret@db:5432/microcity
+    depends_on:
+      gateway:
+        condition: service_started
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # api-orders — Go (net/http)
+  #
+  # Même logique réseau que api-users.
+  # Ports internes différents (8001) pour éviter les conflits sur backend-net.
+  #
+  # Note sur PathPrefix vs Host :
+  #   On utilise PathPrefix ici (routing par chemin URL) plutôt que
+  #   Host (routing par nom de domaine) pour simplifier les tests en local.
+  #   En production on préférerait : Host(`orders.microcity.io`)
+  # ---------------------------------------------------------------------------
+  api-orders:
+    build:
+      context: ./api-orders
+      dockerfile: Dockerfile
+    container_name: microcity-api-orders
+    networks:
+      - frontend-net
+      - backend-net
+      - observability-net
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=microcity_frontend-net"
+      - "traefik.http.routers.api-orders.rule=PathPrefix(`/orders`)"
+      - "traefik.http.routers.api-orders.entrypoints=web"
+      - "traefik.http.services.api-orders.loadbalancer.server.port=8001"
+    environment:
+      # Connexions DNS Docker — résolues uniquement sur backend-net.
+      DATABASE_URL: postgres://microcity:microcity_secret@db:5432/microcity?sslmode=disable
+      RABBITMQ_URL: amqp://microcity:microcity_secret@queue:5672/
+      QUEUE_NAME: orders
+    depends_on:
+      gateway:
+        condition: service_started
+      db:
+        condition: service_healthy
+      queue:
+        condition: service_healthy
+    restart: unless-stopped
+
+
+  # ---------------------------------------------------------------------------
+  # db — PostgreSQL 16
+  #
+  # Réseaux : backend-net UNIQUEMENT.
+  # Aucun port exposé vers l'hôte — db est INVISIBLE depuis l'extérieur.
+  # api-users et api-orders atteignent la DB par DNS Docker : "db:5432"
+  # Ce nom "db" est résolu uniquement sur backend-net.
+  #
+  # Volume nommé db-data : les données survivent aux `docker compose down`.
+  # Sans volume → chaque restart repart de zéro.
+  #
+  # Healthcheck : pg_isready vérifie que PostgreSQL accepte des connexions
+  # avant que les services dépendants ne démarrent (via depends_on: condition).
+  # ---------------------------------------------------------------------------
+  db:
+    image: postgres:16-alpine
+    container_name: microcity-db
+    environment:
+      POSTGRES_DB: microcity
+      POSTGRES_USER: microcity
+      POSTGRES_PASSWORD: microcity_secret
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    networks:
+      - backend-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U microcity -d microcity"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+
+  # ---------------------------------------------------------------------------
+  # queue — RabbitMQ 3 (image management = inclut l'UI web)
+  #
+  # Réseaux : backend-net UNIQUEMENT.
+  # Le port 15672 (UI de management) est exposé vers l'hôte uniquement
+  # pour le débogage local — à retirer en production.
+  # Le port AMQP 5672 n'est PAS exposé → accessible uniquement via backend-net
+  # par les conteneurs qui partagent ce réseau ("queue:5672").
+  #
+  # Le worker et les APIs résolvent "queue" via le DNS Docker de backend-net.
+  # ---------------------------------------------------------------------------
+  queue:
+    image: rabbitmq:3-management
+    container_name: microcity-queue
+    environment:
+      RABBITMQ_DEFAULT_USER: microcity
+      RABBITMQ_DEFAULT_PASS: microcity_secret
+    ports:
+      - "15672:15672"   # UI management — développement uniquement
+    networks:
+      - backend-net
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+
+  # ---------------------------------------------------------------------------
+  # worker — Python (consommateur RabbitMQ)
+  #
+  # Réseaux :
+  #   - backend-net      : résout "queue:5672" pour consommer les messages
+  #   - observability-net: sera scrapé par Prometheus pour ses métriques
+  #
+  # Le worker n'est PAS sur frontend-net → Traefik ne le voit pas,
+  # aucun trafic HTTP entrant ne peut l'atteindre directement.
+  #
+  # depends_on avec condition: service_healthy → Docker attend que RabbitMQ
+  # soit prêt (healthcheck vert) avant de démarrer le worker.
+  # Sans ça, le worker tente de se connecter trop tôt et crash-loop.
+  # ---------------------------------------------------------------------------
+  worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    container_name: microcity-worker
+    environment:
+      RABBITMQ_URL: amqp://microcity:microcity_secret@queue:5672/
+      QUEUE_NAME: orders
+    networks:
+      - backend-net
+      - observability-net
+    depends_on:
+      queue:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # prometheus — collecte les métriques des 3 services toutes les 15 s.
+  #
+  # Pull model : Prometheus vient scraper /metrics sur chaque cible.
+  # Les services exposent leurs métriques via observability-net uniquement —
+  # pas besoin que Traefik ou le frontend y aient accès.
+  #
+  # La config est montée en lecture seule depuis ./observability/prometheus.yml.
+  # Le port 9090 est exposé localement pour explorer l'UI Prometheus en dev.
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: microcity-prometheus
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - observability-net
+    ports:
+      - "9092:9090"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # grafana — visualisation des métriques Prometheus.
+  #
+  # La datasource Prometheus est pré-provisionnée via le dossier
+  # ./observability/grafana/provisioning/datasources/ — Grafana la charge
+  # automatiquement au démarrage, pas besoin de la configurer manuellement.
+  #
+  # grafana-data : volume nommé pour persister les dashboards et réglages.
+  # Port 3000 : UI Grafana — login admin / admin (dev uniquement).
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: microcity-grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    networks:
+      - observability-net
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+
+# =============================================================================
+# Volumes nommés
+# db-data : persiste les données PostgreSQL entre les restarts.
+# Un volume nommé est géré par Docker (dans /var/lib/docker/volumes/),
+# contrairement à un bind mount (./data:/var/lib/...) qui lie à un dossier hôte.
+# =============================================================================
+volumes:
+  db-data:
+    driver: local
+  grafana-data:
+    driver: local
